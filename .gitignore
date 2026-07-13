@@ -1,0 +1,10 @@
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+test-venv/
+verify-testpypi-venv/
+verify-pypi-venv/
+*.log
+e2e-test.png

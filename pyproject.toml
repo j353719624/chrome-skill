@@ -1,0 +1,49 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "chrome-skill"
+version = "1.0.0"
+description = "Local Chrome browser automation skill — drives system Chrome via a Playwright RPC daemon and exposes page snapshots for AI agents."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {file = "LICENSE"}
+authors = [
+    {name = "local"},
+]
+keywords = ["chrome", "browser", "automation", "playwright", "devtools", "rpc", "agent"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Win32 (MS Windows)",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "playwright>=1.40",
+]
+
+[project.scripts]
+chrome-skill = "chrome_skill.cli:main"
+
+[project.urls]
+"Homepage" = "https://github.com/local/chrome-skill"
+"Bug Tracker" = "https://github.com/local/chrome-skill/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/chrome_skill"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "src/chrome_skill",
+    "README.md",
+    "LICENSE",
+    "pyproject.toml",
+]
