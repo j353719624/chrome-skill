@@ -136,34 +136,166 @@ def acquire_single_instance_lock():
             return None, lock_path
 
 
-# ─── 浏览器状态（playwright 持久上下文） ───────────────────────────────────
+# ─── Chrome CDP 连接(独立 Chrome 进程,daemon 只连不启) ──────────────────────
+
+CDP_HOST = "127.0.0.1"
+CDP_PORT = 9222  # Chrome --remote-debugging-port
 
 browser_instance = None
 page_instance = None
 pw_instance = None
 _browser_lock = threading.Lock()
 
+
+def _chrome_user_data_dir():
+    p = os.path.join(_STATE_DIR, "chrome-profile")
+    os.makedirs(p, exist_ok=True)
+    return p
+
+
+def _chrome_is_running():
+    """Return True if Chrome with --remote-debugging-port=CDP_PORT is up.
+
+    Uses raw socket connect() instead of urllib because the daemon process can
+    hang on urllib.urlopen to 127.0.0.1 (Windows network stack oddity in the
+    asyncio executor pool).
+    """
+    import socket
+    try:
+        with socket.create_connection((CDP_HOST, CDP_PORT), timeout=1.0):
+            return True
+    except Exception:
+        return False
+
+
+def _chrome_version():
+    """Return the /json/version body as a dict, or None if Chrome is down."""
+    import urllib.request
+    try:
+        with urllib.request.urlopen(
+            f"http://{CDP_HOST}:{CDP_PORT}/json/version", timeout=2
+        ) as r:
+            return json.loads(r.read().decode())
+    except Exception:
+        return None
+
+
+def _launch_chrome():
+    """Spawn a standalone chrome.exe with --remote-debugging-port=CDP_PORT.
+
+    Chrome is detached (independent lifetime from the daemon), uses the
+    persistent profile dir, and is launched directly without playwright so
+    the user-visible Chrome window comes up fast — same model as QQ Browser
+    where the browser process is a normal desktop app, not a child of an
+    RPC daemon.
+    """
+    user_data_dir = _chrome_user_data_dir()
+    # Locate system Chrome
+    candidates = [
+        os.path.expandvars(r"%ProgramFiles%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%ProgramFiles(x86)%\Google\Chrome\Application\chrome.exe"),
+        os.path.expandvars(r"%LocalAppData%\Google\Chrome\Application\chrome.exe"),
+    ]
+    chrome_exe = next((c for c in candidates if os.path.exists(c)), None)
+    if not chrome_exe:
+        raise RuntimeError(
+            "Chrome not found in standard locations. "
+            "Install Google Chrome from https://www.google.com/chrome/"
+        )
+
+    args = [
+        chrome_exe,
+        f"--remote-debugging-port={CDP_PORT}",
+        f"--user-data-dir={user_data_dir}",
+        "--no-first-run",
+        "--no-default-browser-check",
+        "--disable-background-networking",
+        "--disable-component-update",
+        "--disable-features=Translate,InfiniteSessionRestore",
+        "about:blank",
+    ]
+    flags = 0
+    if sys.platform == "win32":
+        DETACHED_PROCESS = 0x00000008
+        CREATE_NEW_PROCESS_GROUP = 0x00000200
+        flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
+
+    creationflags = flags if sys.platform == "win32" else 0
+    subprocess.Popen(
+        args,
+        creationflags=creationflags,
+        close_fds=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _wait_for_chrome(timeout=15):
+    """Poll /json/version until Chrome responds, or raise on timeout."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if _chrome_is_running():
+            return
+        time.sleep(0.2)
+    raise RuntimeError(f"Chrome did not respond on CDP port {CDP_PORT} within {timeout}s")
+
+
 def _ensure_browser():
+    """Connect playwright to the running Chrome via CDP. Auto-launch Chrome
+    if it is not already running.
+
+    Returns (browser, page). The browser is the playwright Browser object
+    wrapping the externally-launched Chrome process.
+    """
     global browser_instance, page_instance, pw_instance
     with _browser_lock:
-        if browser_instance is None:
-            from playwright.sync_api import sync_playwright
-            pw_instance = sync_playwright().start()
-            # Persistent profile so cookies / localStorage / logins survive
-            # daemon restarts. Without this, every `chrome-skill serve` start
-            # loses login state and triggers login walls (e.g. xiaohongshu).
-            user_data_dir = os.path.join(_STATE_DIR, "chrome-profile")
-            os.makedirs(user_data_dir, exist_ok=True)
-            browser_instance = pw_instance.chromium.launch_persistent_context(
-                user_data_dir=user_data_dir,
-                channel="chrome",
-                headless=False,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],
-            )
-            # launch_persistent_context returns a BrowserContext directly;
-            # `browser.new_page()` is the way to get a page on it.
-            page_instance = browser_instance.new_page()
+        if browser_instance is not None:
+            # Try to reuse — but if Chrome died underneath us, reconnect.
+            try:
+                _ = browser_instance.contexts
+                if page_instance is not None and not page_instance.is_closed():
+                    return browser_instance, page_instance
+            except Exception:
+                browser_instance = None
+                page_instance = None
+                pw_instance = None
+
+        if not _chrome_is_running():
+            logger.info("Chrome not running; launching standalone chrome.exe ...")
+            _launch_chrome()
+            _wait_for_chrome(timeout=20)
+            logger.info("Chrome ready on CDP port %s", CDP_PORT)
+
+        from playwright.sync_api import sync_playwright
+        pw_instance = sync_playwright().start()
+        browser_instance = pw_instance.chromium.connect_over_cdp(
+            f"http://{CDP_HOST}:{CDP_PORT}"
+        )
+        # Reuse the first context's first page if any; otherwise create one.
+        contexts = browser_instance.contexts
+        if contexts and contexts[0].pages:
+            page_instance = contexts[0].pages[0]
+        else:
+            if contexts:
+                page_instance = contexts[0].new_page()
+            else:
+                page_instance = browser_instance.new_page()
     return browser_instance, page_instance
+
+
+def _shutdown_browser_connection():
+    """Disconnect playwright from Chrome (does NOT kill Chrome itself —
+    Chrome stays up as an independent desktop process)."""
+    global browser_instance, page_instance, pw_instance
+    try:
+        if pw_instance:
+            pw_instance.stop()
+    except Exception:
+        pass
+    browser_instance = None
+    page_instance = None
+    pw_instance = None
 
 
 def cmd_go_to_url(url):
@@ -237,16 +369,9 @@ def cmd_status():
 
 
 def cmd_stop():
-    global browser_instance, page_instance, pw_instance
-    try:
-        if pw_instance:
-            pw_instance.stop()
-    except Exception:
-        pass
-    browser_instance = None
-    page_instance = None
-    pw_instance = None
-    remove_state_file()
+    # Stop daemon only. Chrome is an independent desktop process and keeps
+    # running so subsequent `chrome-skill serve` can reconnect instantly.
+    _shutdown_browser_connection()
     return {"success": True}
 
 
@@ -381,10 +506,21 @@ class AsyncHTTPRPCServer:
 def _do_serve(host, ws_port, rpc_port):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
+    # Allow playwright's sync API to run inside this event loop. Without
+    # nest_asyncio, calling _ensure_browser() from a request handler (which
+    # uses run_in_executor on this loop) raises "Sync API inside asyncio loop".
+    try:
+        import nest_asyncio
+        nest_asyncio.apply(loop)
+    except ImportError:
+        logger.warning("nest_asyncio not installed; first RPC may be slow")
     http_server = AsyncHTTPRPCServer(host, rpc_port, None)
     actual_port = loop.run_until_complete(http_server.start())
     write_state_file(os.getpid(), ws_port, actual_port)
     logger.info("Daemon started: pid=%s rpc=%s ws=%s", os.getpid(), actual_port, ws_port)
+    # Warm up Chrome immediately so subsequent RPC calls are fast (<1s)
+    # rather than waiting 5-15s for playwright to lazy-launch on first use.
+    loop.run_in_executor(None, _ensure_browser)
     try:
         loop.run_forever()
     except KeyboardInterrupt:
