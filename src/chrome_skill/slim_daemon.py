@@ -361,6 +361,12 @@ def cmd_markdownify():
             "markdown": p.evaluate("document.body.innerText")}
 
 
+def cmd_eval_content_js(expression):
+    _, p = _ensure_browser()
+    value = p.evaluate(expression)
+    return {"success": True, "value": value}
+
+
 def cmd_status():
     info = get_daemon_info()
     if info:
@@ -389,6 +395,7 @@ COMMANDS = {
     "browser_go_back": lambda: cmd_go_back(),
     "browser_get_info": lambda: cmd_get_info(),
     "browser_markdownify": lambda: cmd_markdownify(),
+    "browser_eval_content_js": lambda expression: cmd_eval_content_js(expression),
     "stop": cmd_stop,
     "status": cmd_status,
 }
@@ -435,7 +442,18 @@ class AsyncHTTPRPCServer:
                     headers[k.strip().lower()] = v.strip()
                 except ValueError:
                     pass
-            content_length = int(headers.get("content-length", "0") or 0)
+            try:
+                content_length = int(headers.get("content-length", "0") or 0)
+            except ValueError:
+                await self._send_json(writer, 400, {"error": "Invalid Content-Length"})
+                return
+            if content_length < 0 or content_length > MAX_REQUEST_BODY_SIZE:
+                await self._send_json(
+                    writer,
+                    413,
+                    {"error": f"Request body exceeds {MAX_REQUEST_BODY_SIZE} bytes"},
+                )
+                return
             body = b""
             if content_length:
                 body = await reader.readexactly(content_length)
@@ -480,35 +498,66 @@ class AsyncHTTPRPCServer:
             return
         loop = asyncio.get_running_loop()
         try:
-            result = await loop.run_in_executor(None, lambda: fn(*args))
+            # Run on the dedicated Playwright executor so that every call
+            # lands on the same thread that owns the Playwright greenlet.
+            result = await loop.run_in_executor(
+                _PLAYWRIGHT_EXECUTOR, lambda: fn(*args)
+            )
         except Exception as e:
             logger.exception("RPC error: %s", e)
             await self._send_json(writer, 500, {"error": str(e)})
             return
         await self._send_json(writer, 200, result)
+        if cmd == "stop":
+            # Send the response before stopping the loop so CLI callers get a
+            # deterministic success result and the daemon exits cleanly.
+            loop.call_soon(loop.stop)
 
     async def _send_json(self, writer, code, obj):
         body = json.dumps(obj, ensure_ascii=False).encode("utf-8")
         reason = {200: "OK", 400: "Bad Request", 401: "Unauthorized",
-                  404: "Not Found", 500: "Internal Server Error"}.get(code, "OK")
+                  404: "Not Found", 413: "Payload Too Large",
+                  500: "Internal Server Error"}.get(code, "OK")
         head = (
-            f"HTTP/1.1 {code} {reason}\r\n"
-            f"Content-Type: application/json; charset=utf-8\r\n"
-            f"Content-Length: {len(body)}\r\n"
-            f"Connection: close\r\n\r\n"
+            f"HTTP/1.1 {code} {reason}" + chr(13) + chr(10)
+            + "Content-Type: application/json; charset=utf-8" + chr(13) + chr(10)
+            + f"Content-Length: {len(body)}" + chr(13) + chr(10)
+            + "Connection: close" + chr(13) + chr(10) + chr(13) + chr(10)
         ).encode("ascii")
-        writer.write(head + body)
-        await writer.drain()
+        try:
+            writer.write(head + body)
+            await writer.drain()
+        except (ConnectionResetError, ConnectionAbortedError, BrokenPipeError):
+            # Client hung up before we finished writing the response. This is
+            # normal during long RPC calls (Playwright timeouts) — don't let
+            # it propagate and crash the daemon.
+            logger.debug("client disconnected before response sent")
+        except RuntimeError as e:
+            # "Event loop is closed" can fire on Windows during shutdown
+            # races. Same treatment: log and swallow.
+            logger.debug("send_json during shutdown: %s", e)
 
 
 # ─── 启动入口 ─────────────────────────────────────────────────────────────────
+
+# Single-worker executor for all Playwright calls. Playwright's sync API
+# binds its greenlet to the thread that created it; if we let asyncio's
+# default executor fan out across the thread pool, every call lands on a
+# different thread and `page.*` raises "Cannot switch to a different
+# thread". A dedicated single-worker executor keeps every Playwright call
+# on the same thread that _ensure_browser() originally ran on.
+import concurrent.futures
+_PLAYWRIGHT_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=1, thread_name_prefix="chrome-skill-pw"
+)
+
 
 def _do_serve(host, ws_port, rpc_port):
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     # Allow playwright's sync API to run inside this event loop. Without
-    # nest_asyncio, calling _ensure_browser() from a request handler (which
-    # uses run_in_executor on this loop) raises "Sync API inside asyncio loop".
+    # nest_asyncio, calling _ensure_browser() from a request handler raises
+    # "Sync API inside asyncio loop".
     try:
         import nest_asyncio
         nest_asyncio.apply(loop)
@@ -516,17 +565,19 @@ def _do_serve(host, ws_port, rpc_port):
         logger.warning("nest_asyncio not installed; first RPC may be slow")
     http_server = AsyncHTTPRPCServer(host, rpc_port, None)
     actual_port = loop.run_until_complete(http_server.start())
-    write_state_file(os.getpid(), ws_port, actual_port)
-    logger.info("Daemon started: pid=%s rpc=%s ws=%s", os.getpid(), actual_port, ws_port)
-    # Warm up Chrome immediately so subsequent RPC calls are fast (<1s)
-    # rather than waiting 5-15s for playwright to lazy-launch on first use.
-    loop.run_in_executor(None, _ensure_browser)
     try:
+        write_state_file(os.getpid(), ws_port, actual_port)
+        logger.info("Daemon started: pid=%s rpc=%s ws=%s", os.getpid(), actual_port, ws_port)
+        # Warm up Chrome immediately on the dedicated Playwright thread. This
+        # pins the greenlet to that worker so all subsequent RPCs reuse the
+        # same browser/page objects.
+        _PLAYWRIGHT_EXECUTOR.submit(_ensure_browser).result(timeout=30)
         loop.run_forever()
     except KeyboardInterrupt:
         pass
     finally:
         loop.run_until_complete(http_server.stop())
+        _PLAYWRIGHT_EXECUTOR.shutdown(wait=False, cancel_futures=True)
         loop.close()
         remove_state_file()
 

@@ -1,19 +1,13 @@
 """
 chrome-skill CLI entry point.
 
-Mirrors the thin surface of qqbrowser-skill:
-    chrome-skill serve
-    chrome-skill status
-    chrome-skill stop
-    chrome-skill browser_snapshot
+Drives a headless Chrome automation daemon (`chrome_skill.slim_daemon`) via
+Playwright. `serve` starts the daemon; every other command sends one RPC call
+to `http://127.0.0.1:<rpc_port>/rpc` and prints the JSON response.
 
-The `serve` command starts a standalone, headless Chrome automation daemon
-(`chrome_skill.slim_daemon`) that drives Chrome via Playwright directly and
-exposes an HTTP RPC endpoint on a dynamic port. The `browser_snapshot`
-command talks to that endpoint.
-
-For the heavyweight multi-tab daemon (Chrome extension bridge), call
-`python -m chrome_skill.daemon_server` directly.
+Surface mirrors qqbrowser-skill so existing agent scripts that target
+qqbrowser-skill work with chrome-skill unchanged. Run `chrome-skill --help`
+for the full list.
 """
 import argparse
 import json
@@ -23,6 +17,8 @@ import sys
 import urllib.error
 import urllib.request
 
+
+# ── daemon RPC plumbing ───────────────────────────────────────────────────────
 
 def _state_dir():
     return os.path.join(
@@ -45,13 +41,34 @@ def _read_state():
         return None
 
 
-def cmd_serve(_args):
-    # Delegate to the standalone daemon module. Its own argparse expects
-    # `serve` as the only positional subcommand; no extra args to forward
-    # for the default surface.
-    cmd = [sys.executable, "-m", "chrome_skill.slim_daemon", "serve"]
-    raise SystemExit(subprocess.call(cmd))
+def _rpc(cmd, args=None):
+    info = _read_state()
+    if not info:
+        print("Daemon not running", file=sys.stderr)
+        sys.exit(1)
+    rpc_port = info.get("rpc_port")
+    auth_token = info.get("auth_token", "")
+    if not rpc_port:
+        print("Daemon state file is missing rpc_port", file=sys.stderr)
+        sys.exit(1)
+    payload = json.dumps({"cmd": cmd, "args": args or []}).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{rpc_port}/rpc", data=payload, method="POST")
+    req.add_header("Content-Type", "application/json")
+    if auth_token:
+        req.add_header("Authorization", f"Bearer {auth_token}")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as r:
+            sys.stdout.write(r.read().decode())
+    except urllib.error.HTTPError as e:
+        print(f"HTTP {e.code}: {e.read().decode()}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: {e}", file=sys.stderr)
+        sys.exit(1)
 
+
+# ── lifecycle ────────────────────────────────────────────────────────────────
 
 def cmd_status(_args):
     info = _read_state()
@@ -67,77 +84,63 @@ def cmd_status(_args):
         print("Daemon not running")
 
 
-def cmd_stop(_args):
-    info = _read_state()
-    if not info:
-        print("Daemon not running")
-        return
-    rpc_port = info.get("rpc_port", 9866)
-    auth_token = info.get("auth_token", "")
-    payload = json.dumps({"cmd": "stop", "args": []}).encode()
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{rpc_port}/rpc", data=payload, method="POST")
-    req.add_header("Content-Type", "application/json")
-    if auth_token:
-        req.add_header("Authorization", f"Bearer {auth_token}")
-    try:
-        urllib.request.urlopen(req, timeout=5)
-        print("Stop signal sent")
-    except Exception:
-        print("Daemon not running")
+# ── main ──────────────────────────────────────────────────────────────────────
 
-
-def cmd_browser_snapshot(_args):
-    info = _read_state()
-    if not info:
-        print("Daemon not running", file=sys.stderr)
-        sys.exit(1)
-    rpc_port = info.get("rpc_port")
-    auth_token = info.get("auth_token", "")
-    if not rpc_port:
-        print("Daemon state file is missing rpc_port", file=sys.stderr)
-        sys.exit(1)
-    payload = json.dumps({"cmd": "browser_snapshot", "args": []}).encode()
-    req = urllib.request.Request(
-        f"http://127.0.0.1:{rpc_port}/rpc", data=payload, method="POST")
-    req.add_header("Content-Type", "application/json")
-    if auth_token:
-        req.add_header("Authorization", f"Bearer {auth_token}")
-    try:
-        with urllib.request.urlopen(req, timeout=60) as r:
-            print(r.read().decode())
-    except urllib.error.HTTPError as e:
-        print(f"HTTP {e.code}: {e.read().decode()}", file=sys.stderr)
-        sys.exit(1)
-    except Exception as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+# Keep this list in sync with slim_daemon.COMMANDS so --help reflects reality.
+_BROWSER_COMMANDS = [
+    ("browser_go_to_url",           "Navigate to URL in the current tab."),
+    ("browser_go_back",             "Go back to the previous page."),
+    ("browser_wait",                "Wait for N seconds (default 3)."),
+    ("browser_click_element",       "Click on an element by selector."),
+    ("browser_input_text",          "Type text into an input element."),
+    ("browser_snapshot",            "Get current page as JSON."),
+    ("browser_screenshot",          "Take a screenshot to a file path."),
+    ("browser_scroll_down",         "Scroll the page down."),
+    ("browser_scroll_to_text",      "Scroll the page until text is visible."),
+    ("browser_get_info",            "Get current URL and title."),
+    ("browser_markdownify",         "Return page body innerText as markdown."),
+    ("browser_eval_content_js",     "Evaluate a JS expression; pass the code as the first positional arg."),
+]
 
 
 def main(argv=None):
+    if argv is None:
+        argv = sys.argv[1:]
+
     parser = argparse.ArgumentParser(
         prog="chrome-skill",
         description="Local Chrome browser automation skill.",
     )
     sub = parser.add_subparsers(dest="cmd")
+
     sub.add_parser("serve", help="start daemon (foreground)")
     sub.add_parser("status", help="check daemon health")
     sub.add_parser("stop", help="stop daemon")
-    sub.add_parser("browser_snapshot", help="return current page as JSON")
 
-    args = parser.parse_args(argv)
+    for name, help_text in _BROWSER_COMMANDS:
+        sub.add_parser(name, help=help_text)
 
-    handlers = {
-        "serve": cmd_serve,
-        "status": cmd_status,
-        "stop": cmd_stop,
-        "browser_snapshot": cmd_browser_snapshot,
-    }
-    handler = handlers.get(args.cmd)
-    if handler is None:
+    # parse_known_args: anything after the subcommand is forwarded verbatim
+    # to the daemon RPC. We intentionally do NOT declare per-command arg
+    # schemas in the CLI; the slim_daemon's COMMANDS table is the source of
+    # truth for which positional args each command takes.
+    args, rest = parser.parse_known_args(argv)
+
+    if args.cmd is None:
         parser.print_help()
         sys.exit(2)
-    handler(args)
+    if args.cmd == "serve":
+        raise SystemExit(subprocess.call([sys.executable, "-m",
+                                          "chrome_skill.slim_daemon", "serve"]))
+    if args.cmd == "status":
+        cmd_status(args)
+        return
+    if args.cmd == "stop":
+        _rpc("stop", [])
+        return
+
+    # Any browser_* subcommand: forward `rest` as positional RPC args.
+    _rpc(args.cmd, rest)
 
 
 if __name__ == "__main__":

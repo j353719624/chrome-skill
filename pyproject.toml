@@ -29,6 +29,7 @@ classifiers = [
 dependencies = [
     "playwright>=1.40",
     "nest_asyncio>=1.5",
+    "websockets>=13,<16",
 ]
 
 [project.scripts]
